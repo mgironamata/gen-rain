@@ -66,16 +66,32 @@ class GaussianRainfieldGenerator:
         return f.view(n_samples, self.H, self.W)  # reshape into images
 
     @torch.no_grad()
-    def sample_precip(self, n_samples: int = 1) -> torch.Tensor:
+    def sample_precip(self, n_samples: int = 1, occurrence_only: bool = False) -> torch.Tensor:
         """
-        Returns a tensor of shape (n_samples, 1, H, W) with precipitation in mm.
-        Zeros indicate dry pixels.
+        Generate rainfall fields.
+
+        Parameters
+        ----------
+        n_samples : int
+            Number of fields to generate.
+        occurrence_only : bool, optional
+            If ``True`` return only the binary wet/dry mask.  If ``False``
+            return precipitation amounts in millimetres.  Defaults to ``False``.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of shape ``(n_samples, 1, H, W)`` representing precipitation
+            occurrence or amount.
         """
         latent = self._sample_latent_gp(n_samples)
 
         # ---------- Stage 1: wet/dry mask -----------------------
         prob_wet = torch.sigmoid(latent)          # logistic GP(0, K)
         mask      = (prob_wet > self.wet_thr).float()
+
+        if occurrence_only:
+            return mask.unsqueeze(1)
 
         # ---------- Stage 2: intensities on wet pixels ----------
         if self.amount_dist == "gamma":
@@ -89,10 +105,15 @@ class GaussianRainfieldGenerator:
         return rainfall.unsqueeze(1)              # add channel dim
 
     # ---------- optional convenience: PyTorch Dataset ----------
-    def make_dataset(self, n_samples: int):
+    def make_dataset(self, n_samples: int, occurrence_only: bool = False):
+        """Return a simple :class:`torch.utils.data.Dataset` of generated fields."""
         gen = self
         class _Rainset(Dataset):
-            def __len__(self): return n_samples
+            def __len__(self):
+                return n_samples
+
             def __getitem__(self, idx):
-                return gen.sample_precip(1)[0]    # (1, H, W)
+                # Fetch a single sample according to the requested output type
+                return gen.sample_precip(1, occurrence_only=occurrence_only)[0]
+
         return _Rainset()
