@@ -1,0 +1,98 @@
+# ================================================================
+#  Synthetic precipitation generator based on a 2-D Gaussian Field
+# ================================================================
+import math
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+# ---------- helper: RBF / Matérn kernel -------------------------
+def rbf_kernel(X, length_scale: float, variance: float = 1.0):
+    """Squared-exponential kernel K_ij = σ² exp(-‖xi-xj‖² / 2ℓ²)."""
+    sqdist = torch.cdist(X, X, p=2.0) ** 2
+    return variance * torch.exp(-0.5 * sqdist / length_scale**2)
+
+# ---------- core class ------------------------------------------
+class GaussianRainfieldGenerator:
+    """
+    Quickly samples spatial rainfall fields on a regular grid.
+      • latent GP (zero-mean, RBF kernel)  -> probability of rain
+      • logistic transform + threshold    -> wet/dry mask
+      • positive rain amounts (Gamma/LogNormal) on wet pixels
+    """
+    def __init__(
+        self,
+        grid_height      = 64,
+        grid_width       = 64,
+        length_scale     = 0.15,    # in units of domain ∈[0,1]
+        gp_variance      = 1.0,
+        wet_threshold    = 0.5,     # logits threshold (~50 % coverage)
+        amount_dist      = "gamma", # or "lognormal"
+        gamma_shape      = 2.0,
+        gamma_scale      = 5.0,     # mm
+        lognorm_mu       = 1.0,
+        lognorm_sigma    = 0.5,
+        device           = "cpu"
+    ):
+        self.H, self.W  = grid_height, grid_width
+        self.amount_dist = amount_dist.lower()
+        self.wet_thr     = wet_threshold
+        self.device      = device
+
+        # Assign the distribution parameters to self
+        self.gamma_shape = gamma_shape
+        self.gamma_scale = gamma_scale
+        self.lognorm_mu = lognorm_mu
+        self.lognorm_sigma = lognorm_sigma
+
+
+        # create (x,y) coordinates in [0,1]×[0,1]
+        xs, ys = torch.linspace(0, 1, grid_width), torch.linspace(0, 1, grid_height)
+        X, Y   = torch.meshgrid(xs, ys, indexing="xy")
+        coords = torch.stack((X.flatten(), Y.flatten()), dim=1).to(device)
+
+        # pre-compute Cholesky factor of the covariance matrix
+        K   = rbf_kernel(coords, length_scale, gp_variance)        # (N,N)
+        # Increase jitter for improved numerical stability with large matrices
+        jitter = 1e-3 * torch.eye(K.shape[0], device=device)       # for stability
+        self.L = torch.linalg.cholesky(K + jitter)                 # lower-triangular
+        self.N = K.shape[0]
+
+    @torch.no_grad()
+    def _sample_latent_gp(self, n_samples: int) -> torch.Tensor:
+        """Draw n latent Gaussian fields ∼ GP(0, K); returns (n, H, W)."""
+        z = torch.randn(n_samples, self.N, device=self.device)
+        f = (self.L @ z.T).T                      # (n, N)
+        return f.view(n_samples, self.H, self.W)  # reshape into images
+
+    @torch.no_grad()
+    def sample_precip(self, n_samples: int = 1) -> torch.Tensor:
+        """
+        Returns a tensor of shape (n_samples, 1, H, W) with precipitation in mm.
+        Zeros indicate dry pixels.
+        """
+        latent = self._sample_latent_gp(n_samples)
+
+        # ---------- Stage 1: wet/dry mask -----------------------
+        prob_wet = torch.sigmoid(latent)          # logistic GP(0, K)
+        mask      = (prob_wet > self.wet_thr).float()
+
+        # ---------- Stage 2: intensities on wet pixels ----------
+        if self.amount_dist == "gamma":
+            shape, scale = self.gamma_shape, self.gamma_scale
+            amounts = torch.distributions.Gamma(shape, 1/scale).sample(latent.shape)
+        else:   # log-normal
+            mu, sigma = self.lognorm_mu, self.lognorm_sigma
+            amounts = torch.distributions.LogNormal(mu, sigma).sample(latent.shape)
+
+        rainfall = mask * amounts                 # element-wise
+        return rainfall.unsqueeze(1)              # add channel dim
+
+    # ---------- optional convenience: PyTorch Dataset ----------
+    def make_dataset(self, n_samples: int):
+        gen = self
+        class _Rainset(Dataset):
+            def __len__(self): return n_samples
+            def __getitem__(self, idx):
+                return gen.sample_precip(1)[0]    # (1, H, W)
+        return _Rainset()
