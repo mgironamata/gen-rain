@@ -2,7 +2,6 @@
 #  Synthetic precipitation generator based on a 2-D Gaussian Field
 # ================================================================
 import math
-import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -32,6 +31,9 @@ class GaussianRainfieldGenerator:
         gamma_scale      = 5.0,     # mm
         lognorm_mu       = 1.0,
         lognorm_sigma    = 0.5,
+        correlated_intensity = False,
+        amount_length_scale = None,
+        amount_variance = 1.0,
         device           = "cpu"
     ):
         self.H, self.W  = grid_height, grid_width
@@ -45,24 +47,40 @@ class GaussianRainfieldGenerator:
         self.lognorm_mu = lognorm_mu
         self.lognorm_sigma = lognorm_sigma
 
+        self.corr_intensity = correlated_intensity
+        if amount_length_scale is None:
+            amount_length_scale = length_scale
+        self.amount_length_scale = amount_length_scale
+        self.amount_variance = amount_variance
+
 
         # create (x,y) coordinates in [0,1]×[0,1]
         xs, ys = torch.linspace(0, 1, grid_width), torch.linspace(0, 1, grid_height)
         X, Y   = torch.meshgrid(xs, ys, indexing="xy")
         coords = torch.stack((X.flatten(), Y.flatten()), dim=1).to(device)
 
-        # pre-compute Cholesky factor of the covariance matrix
+        # pre-compute Cholesky factor of the covariance matrix for occurrence
         K   = rbf_kernel(coords, length_scale, gp_variance)        # (N,N)
-        # Increase jitter for improved numerical stability with large matrices
-        jitter = 1e-3 * torch.eye(K.shape[0], device=device)       # for stability
+        jitter = 1e-3 * torch.eye(K.shape[0], device=device)       # numerical stability
         self.L = torch.linalg.cholesky(K + jitter)                 # lower-triangular
         self.N = K.shape[0]
 
+        # Optional second GP for rainfall amounts
+        if self.corr_intensity:
+            K_amt = rbf_kernel(coords, self.amount_length_scale, self.amount_variance)
+            jitter_amt = 1e-3 * torch.eye(K_amt.shape[0], device=device)
+            self.L_amt = torch.linalg.cholesky(K_amt + jitter_amt)
+        else:
+            self.L_amt = None
+
     @torch.no_grad()
-    def _sample_latent_gp(self, n_samples: int) -> torch.Tensor:
+    def _sample_latent_gp(self, n_samples: int, L=None) -> torch.Tensor:
         """Draw n latent Gaussian fields ∼ GP(0, K); returns (n, H, W)."""
-        z = torch.randn(n_samples, self.N, device=self.device)
-        f = (self.L @ z.T).T                      # (n, N)
+        if L is None:
+            L = self.L
+        N = L.shape[0]
+        z = torch.randn(n_samples, N, device=self.device)
+        f = (L @ z.T).T                      # (n, N)
         return f.view(n_samples, self.H, self.W)  # reshape into images
 
     @torch.no_grad()
@@ -94,10 +112,14 @@ class GaussianRainfieldGenerator:
             return mask.unsqueeze(1)
 
         # ---------- Stage 2: intensities on wet pixels ----------
-        if self.amount_dist == "gamma":
+        if self.corr_intensity:
+            latent_amt = self._sample_latent_gp(n_samples, self.L_amt)
+            mu, sigma = self.lognorm_mu, self.lognorm_sigma
+            amounts = torch.exp(mu + sigma * latent_amt)
+        elif self.amount_dist == "gamma":
             shape, scale = self.gamma_shape, self.gamma_scale
             amounts = torch.distributions.Gamma(shape, 1/scale).sample(latent.shape)
-        else:   # log-normal
+        else:   # log-normal with independent pixels
             mu, sigma = self.lognorm_mu, self.lognorm_sigma
             amounts = torch.distributions.LogNormal(mu, sigma).sample(latent.shape)
 
