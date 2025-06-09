@@ -27,6 +27,40 @@ class TinyUNet(nn.Module):
         return self.out(h1 + h3)
 
 # -----------------------------------------------------------
+#  Larger UNet with two downsample/upsample stages
+# -----------------------------------------------------------
+class LargeUNet(nn.Module):
+    def __init__(self, in_ch=1, out_ch=1, base=32):
+        super().__init__()
+        def block(ic, oc):
+            return nn.Sequential(
+                nn.Conv2d(ic, oc, 3, padding=1), nn.ReLU(),
+                nn.Conv2d(oc, oc, 3, padding=1), nn.ReLU(),
+            )
+
+        self.inc = block(in_ch, base)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), block(base, base * 2))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), block(base * 2, base * 4))
+
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            block(base * 4, base * 2),
+        )
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            block(base * 2, base),
+        )
+        self.out = nn.Conv2d(base, out_ch, 1)
+
+    def forward(self, x, t_emb):
+        h1 = self.inc(x + t_emb)
+        h2 = self.down1(h1 + t_emb)
+        h3 = self.down2(h2 + t_emb)
+        u1 = self.up1(h3 + t_emb) + h2
+        u2 = self.up2(u1 + t_emb)
+        return self.out(u2 + h1)
+
+# -----------------------------------------------------------
 #  Helper: sinusoidal timestep embedding  (1×H×W broadcast)
 # -----------------------------------------------------------
 def time_embedding(t, H, W, device):
