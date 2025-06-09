@@ -1,0 +1,4 @@
+torch>=2.2.0      # core deep-learning library (includes torch.nn, torch.utils.data)
+numpy>=1.26       # numerical routines used by torch & GP generator
+matplotlib>=3.8   # quick visual checks / demo plots
+tqdm>=4.66        # optional: nice progress bars in longer training loops
