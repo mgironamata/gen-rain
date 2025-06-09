@@ -6,6 +6,8 @@ import torch, torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
+device 
+
 # -----------------------------------------------------------
 #  Simple UNet backbone (works for both tasks)
 # -----------------------------------------------------------
@@ -177,3 +179,35 @@ def train(model, loader, epochs=10, lr=2e-4, lam=1.0, device='cuda'):
             tot_mask += Lmask.item();  tot_amt += Lamt.item()
         print(f"Epoch {ep+1:02d}: Lmask={tot_mask/len(loader):.4f} | "
               f"Lamt={tot_amt/len(loader):.4f}")
+        
+# ---- sampling ------------------------------------------
+@torch.no_grad()
+def sample(model, n=4):
+    H = W = 32
+    # --- 1) sample mask via reverse discrete process ----
+    x_t = torch.randint(0,2,(n,1,H,W), device=device)    # start from noise
+    for t in reversed(range(1,model.disc.T+1)):
+        t_batch = torch.full((n,), t, device=device)
+        t_emb = time_embedding(t_batch, H, W, device)
+        logits = model.unet_mask(torch.cat([x_t.float(), t_emb],1), 0)
+        probs  = F.softmax(logits, 1)[:,1:2]             # prob(wet)
+        x0_pred = (probs > 0.5).float()
+        # simplistic posterior sample: copy pred
+        x_t = x0_pred
+    mask = x_t                                           # (n,1,H,W)
+    # --- 2) sample intensity conditioned on mask --------
+    y_t = torch.randn_like(mask)                         # Gaussian noise
+    for t in reversed(range(1,model.cont.T+1)):
+        t_b = torch.full((n,), t, device=device)
+        t_emb = time_embedding(t_b, H, W, device)
+        cond = torch.cat([y_t, mask], 1)
+        eps_hat = model.unet_rain(torch.cat([cond, t_embunet_rain],1), 0)
+        alpha_t = model.cont.alpha[t_b].view(-1,1,1,1)
+        alpha_bar_t = model.cont.alpha_bar[t_b].view(-1,1,1,1)
+        y0_pred = (y_t - (1 - alpha_t).sqrt() * eps_hat) / alpha_t.sqrt()
+        if t > 1:
+            noise = torch.randn_like(y_t)
+            y_t = alpha_t.sqrt() * y0_pred + (1-alpha_t).sqrt() * noise
+        else:
+            y_t = y0_pred
+    return (y_t * mask).cpu()             # final precip field
