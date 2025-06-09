@@ -54,7 +54,7 @@ class GaussianRainfieldGenerator:
         # pre-compute Cholesky factor of the covariance matrix
         K   = rbf_kernel(coords, length_scale, gp_variance)        # (N,N)
         # Increase jitter for improved numerical stability with large matrices
-        jitter = 1e-3 * torch.eye(K.shape[0], device=device)       # for stability
+        jitter = 1e-5 * torch.eye(K.shape[0], device=device)       # for stability
         self.L = torch.linalg.cholesky(K + jitter)                 # lower-triangular
         self.N = K.shape[0]
 
