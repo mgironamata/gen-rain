@@ -6,7 +6,8 @@ import torch, torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-device 
+# Use GPU if available during sampling
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # -----------------------------------------------------------
 #  Simple UNet backbone (works for both tasks)
@@ -201,13 +202,13 @@ def sample(model, n=4):
         t_b = torch.full((n,), t, device=device)
         t_emb = time_embedding(t_b, H, W, device)
         cond = torch.cat([y_t, mask], 1)
-        eps_hat = model.unet_rain(torch.cat([cond, t_embunet_rain],1), 0)
-        alpha_t = model.cont.alpha[t_b].view(-1,1,1,1)
+        eps_hat = model.unet_rain(torch.cat([cond, t_emb], 1), 0)
         alpha_bar_t = model.cont.alpha_bar[t_b].view(-1,1,1,1)
-        y0_pred = (y_t - (1 - alpha_t).sqrt() * eps_hat) / alpha_t.sqrt()
+        y0_pred = (y_t - (1 - alpha_bar_t).sqrt() * eps_hat) / alpha_bar_t.sqrt()
         if t > 1:
+            alpha_bar_prev = model.cont.alpha_bar[t_b - 1].view(-1,1,1,1)
             noise = torch.randn_like(y_t)
-            y_t = alpha_t.sqrt() * y0_pred + (1-alpha_t).sqrt() * noise
+            y_t = alpha_bar_prev.sqrt() * y0_pred + (1 - alpha_bar_prev).sqrt() * noise
         else:
             y_t = y0_pred
     return (y_t * mask).cpu()             # final precip field
