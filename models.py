@@ -138,7 +138,7 @@ class JointRainDiffuser(nn.Module):
         # TWO separate UNets ------------------------------
         self.unet_mask = TinyUNet(in_ch=1+64, out_ch=2).to(device)  # logits
         self.unet_rain = TinyUNet(in_ch=2+64, out_ch=1).to(device)  # ε-hat
-    def forward(self, batch):
+    def forward(self, batch, mask_only: bool = False):
         # The DataLoader returns a tensor of shape (B, 1, H, W) directly,
         # not a dictionary.
         x_amt = batch.to(self.device)    # (B,1,H,W)
@@ -151,19 +151,22 @@ class JointRainDiffuser(nn.Module):
         disc_in = torch.cat([x_t_mask.float(), t_emb], dim=1)
         logits = self.unet_mask(disc_in, 0)        # t already embedded
         loss_mask = self.disc.loss(logits, x0_mask, t_d)
-        # ---------- 2: continuous branch ---------------
-        t_c = torch.randint(1, self.cont.T+1, (B,), device=self.device)
-        x_t_amt, eps = self.cont.q_sample(x_amt, t_c)
-        cond = torch.cat([x_t_amt, x0_mask], dim=1)         # add mask as input
-        t_emb2 = time_embedding(t_c, H, W, self.device)
-        eps_hat = self.unet_rain(torch.cat([cond, t_emb2], 1), 0)
-        loss_amt = self.cont.loss(eps_hat, eps, x0_mask)    # only wet pixels
+        if mask_only:
+            loss_amt = torch.tensor(0.0, device=self.device)
+        else:
+            # ---------- 2: continuous branch ---------------
+            t_c = torch.randint(1, self.cont.T+1, (B,), device=self.device)
+            x_t_amt, eps = self.cont.q_sample(x_amt, t_c)
+            cond = torch.cat([x_t_amt, x0_mask], dim=1)         # add mask as input
+            t_emb2 = time_embedding(t_c, H, W, self.device)
+            eps_hat = self.unet_rain(torch.cat([cond, t_emb2], 1), 0)
+            loss_amt = self.cont.loss(eps_hat, eps, x0_mask)    # only wet pixels
         return loss_mask, loss_amt
 
 # -----------------------------------------------------------
 #  4) Training loop (plain PyTorch) --------------------------
 # -----------------------------------------------------------
-def train(model, loader, epochs=10, lr=2e-4, lam=1.0, device='cuda'):
+def train(model, loader, epochs=10, lr=2e-4, lam=1.0, device='cuda', occurrence_only: bool = False):
     opt = torch.optim.AdamW(itertools.chain(model.unet_mask.parameters(),
                                             model.unet_rain.parameters()), lr=lr)
     for ep in range(epochs):
@@ -171,19 +174,24 @@ def train(model, loader, epochs=10, lr=2e-4, lam=1.0, device='cuda'):
         for idx, batch in enumerate(loader):
             opt.zero_grad()
             # Pass the batch tensor directly to the model
-            Lmask, Lamt = model(batch)
-            loss = Lmask + lam * Lamt
+            Lmask, Lamt = model(batch, mask_only=occurrence_only)
+            loss = Lmask if occurrence_only else Lmask + lam * Lamt
             # if idx % 10 == 0:
             #   print(loss.item())
             loss.backward()
             opt.step()
             tot_mask += Lmask.item();  tot_amt += Lamt.item()
-        print(f"Epoch {ep+1:02d}: Lmask={tot_mask/len(loader):.4f} | "
-              f"Lamt={tot_amt/len(loader):.4f}")
+        if occurrence_only:
+            print(f"Epoch {ep+1:02d}: Lmask={tot_mask/len(loader):.4f}")
+        else:
+            print(
+                f"Epoch {ep+1:02d}: Lmask={tot_mask/len(loader):.4f} | "
+                f"Lamt={tot_amt/len(loader):.4f}"
+            )
         
 # ---- sampling ------------------------------------------
 @torch.no_grad()
-def sample(model, n=4):
+def sample(model, n=4, occurrence_only: bool = False):
     H = W = 32
     # --- 1) sample mask via reverse discrete process ----
     x_t = torch.randint(0,2,(n,1,H,W), device=device)    # start from noise
@@ -196,6 +204,8 @@ def sample(model, n=4):
         # simplistic posterior sample: copy pred
         x_t = x0_pred
     mask = x_t                                           # (n,1,H,W)
+    if occurrence_only:
+        return mask.cpu()
     # --- 2) sample intensity conditioned on mask --------
     y_t = torch.randn_like(mask)                         # Gaussian noise
     for t in reversed(range(1,model.cont.T+1)):
