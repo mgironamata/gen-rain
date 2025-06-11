@@ -64,7 +64,7 @@ class LargeUNet(nn.Module):
         return self.out(u2 + h1)
 
 # -----------------------------------------------------------
-#  Helper: sinusoidal timestep embedding  (1×H×W broadcast)
+#  Helper: sinusoidal timestep embedding  (broadcastable scalar)
 # -----------------------------------------------------------
 def time_embedding(t, H, W, device):
     # t: (B,) in [0,T)
