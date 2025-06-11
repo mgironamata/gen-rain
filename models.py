@@ -70,8 +70,9 @@ def time_embedding(t, H, W, device):
     # t: (B,) in [0,T)
     half = 32
     freqs = torch.exp(-math.log(1e4) * torch.arange(half, device=device) / half)
-    emb = torch.cat([torch.sin(t[:,None]*freqs), torch.cos(t[:,None]*freqs)], dim=1)
-    return emb[:,:,None,None].repeat(1,1,H,W)    # (B,64,H,W)
+    emb = torch.cat([torch.sin(t[:, None] * freqs), torch.cos(t[:, None] * freqs)], dim=1)
+    emb = emb.mean(dim=1, keepdim=True)                  # (B,1)
+    return emb[:, :, None, None]                         # broadcastable scalar
 
 # -----------------------------------------------------------
 #  1) Discrete diffusion for wet/dry mask  (Austin et al. 2021)
@@ -136,8 +137,8 @@ class JointRainDiffuser(nn.Module):
         self.disc = BinaryD3PM(T=T, device=device)
         self.cont = GaussianDDPM(T=T, device=device)
         # TWO separate UNets ------------------------------
-        self.unet_mask = TinyUNet(in_ch=1+64, out_ch=2).to(device)  # logits
-        self.unet_rain = TinyUNet(in_ch=2+64, out_ch=1).to(device)  # ε-hat
+        self.unet_mask = TinyUNet(in_ch=1, out_ch=2).to(device)  # logits
+        self.unet_rain = TinyUNet(in_ch=2, out_ch=1).to(device)  # ε-hat
     def forward(self, batch, mask_only: bool = False):
         # The DataLoader returns a tensor of shape (B, 1, H, W) directly,
         # not a dictionary.
@@ -145,21 +146,20 @@ class JointRainDiffuser(nn.Module):
         x0_mask = (x_amt > 0).float()              # binary wet/dry
         B,_,H,W = x_amt.shape
         # ---------- 1: discrete branch -----------------
-        t_d = torch.randint(1, self.disc.T+1, (B,), device=self.device)
+        t_d = torch.randint(1, self.disc.T + 1, (B,), device=self.device)
         x_t_mask = self.disc.q_sample(x0_mask, t_d)
         t_emb = time_embedding(t_d, H, W, self.device)
-        disc_in = torch.cat([x_t_mask.float(), t_emb], dim=1)
-        logits = self.unet_mask(disc_in, 0)        # t already embedded
+        logits = self.unet_mask(x_t_mask.float(), t_emb)
         loss_mask = self.disc.loss(logits, x0_mask, t_d)
         if mask_only:
             loss_amt = torch.tensor(0.0, device=self.device)
         else:
             # ---------- 2: continuous branch ---------------
-            t_c = torch.randint(1, self.cont.T+1, (B,), device=self.device)
+            t_c = torch.randint(1, self.cont.T + 1, (B,), device=self.device)
             x_t_amt, eps = self.cont.q_sample(x_amt, t_c)
-            cond = torch.cat([x_t_amt, x0_mask], dim=1)         # add mask as input
+            cond = torch.cat([x_t_amt, x0_mask], dim=1)  # add mask as input
             t_emb2 = time_embedding(t_c, H, W, self.device)
-            eps_hat = self.unet_rain(torch.cat([cond, t_emb2], 1), 0)
+            eps_hat = self.unet_rain(cond, t_emb2)
             loss_amt = self.cont.loss(eps_hat, eps, x0_mask)    # only wet pixels
         return loss_mask, loss_amt
 
@@ -198,7 +198,7 @@ def sample(model, n=4, occurrence_only: bool = False):
     for t in reversed(range(1,model.disc.T+1)):
         t_batch = torch.full((n,), t, device=device)
         t_emb = time_embedding(t_batch, H, W, device)
-        logits = model.unet_mask(torch.cat([x_t.float(), t_emb],1), 0)
+        logits = model.unet_mask(x_t.float(), t_emb)
         probs  = F.softmax(logits, 1)[:,1:2]             # prob(wet)
         x0_pred = (probs > 0.5).float()
         # simplistic posterior sample: copy pred
@@ -212,7 +212,7 @@ def sample(model, n=4, occurrence_only: bool = False):
         t_b = torch.full((n,), t, device=device)
         t_emb = time_embedding(t_b, H, W, device)
         cond = torch.cat([y_t, mask], 1)
-        eps_hat = model.unet_rain(torch.cat([cond, t_emb], 1), 0)
+        eps_hat = model.unet_rain(cond, t_emb)
         alpha_bar_t = model.cont.alpha_bar[t_b].view(-1,1,1,1)
         y0_pred = (y_t - (1 - alpha_bar_t).sqrt() * eps_hat) / alpha_bar_t.sqrt()
         if t > 1:
